@@ -1,77 +1,99 @@
 # ccburn
 
-Two flavors of a usage dashboard for Claude Code. Both read your local
-`~/.claude/projects/**/*.jsonl` transcripts (no API calls, no network).
+A usage dashboard for Claude Code. Reads your local `~/.claude/projects/**/*.jsonl`
+transcripts (no API calls, no network).
 
 - **`ccburn_web.py`** — pretty browser dashboard (recommended)
-- **`ccburn.py`** — terminal dashboard (fallback, no browser needed)
+- **`ccburn.py`** — terminal dashboard (fallback)
+- **`ccburn_lib.py`** — shared logic (don't run directly)
 
 ## Install (one-time)
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-## Web dashboard (recommended)
+## Run
 
 ```bash
-python ccburn_web.py
+python ccburn_web.py        # opens browser at http://127.0.0.1:8765
+python ccburn.py            # one-shot terminal render
+python ccburn.py --watch 5  # terminal, refresh every 5s
 ```
 
-A browser tab opens at <http://127.0.0.1:8765> with two animated panels
-(session + weekly), gradient progress bars, and area charts. Auto-refreshes
-every 5 seconds. Press Ctrl+C to stop.
+## Make the numbers match claude.ai
 
-Options:
+The first time you run this, the % won't perfectly line up with the official
+dashboard at claude.ai (Anthropic doesn't publish their exact formula or limits).
+**Calibrate it in 10 seconds:**
+
+1. Open <https://claude.ai/settings/usage> and note your current %s
+2. Run with `--calibrate-session` and `--calibrate-weekly`:
 
 ```bash
-python ccburn_web.py --plan max5     # default; also: pro, max20
-python ccburn_web.py --port 9000
-python ccburn_web.py --no-open       # don't auto-open browser
+python ccburn.py --calibrate-session 16 --calibrate-weekly 38
 ```
 
-## Terminal dashboard (fallback)
+That saves the right budgets to `~/.ccburn.json`. Future runs load it
+automatically. Re-calibrate any time the numbers drift.
+
+## Match the weekly reset
+
+claude.ai's weekly limit resets on a specific day/hour (e.g. "Resets Mon 11:00 AM").
+Tell ccburn yours:
 
 ```bash
-python ccburn.py                     # one-shot render
-python ccburn.py --watch 5           # refresh every 5 seconds
-python ccburn.py --plan pro
+python ccburn_web.py --week-reset-day 0 --week-reset-hour 11
 ```
 
-## Configure limits
-
-Token budgets are plan-dependent and not published by Anthropic. Defaults are
-calibrated guesses per `--plan`:
-
-| Plan    | Session (weighted tokens) | Weekly         |
-|---------|---------------------------|----------------|
-| `pro`   |   5,000,000               |   40,000,000   |
-| `max5`  |  30,000,000 (default)     |  250,000,000   |
-| `max20` | 120,000,000               | 1,000,000,000  |
-
-Override with flags or env vars:
+`--week-reset-day`: `0` = Monday … `6` = Sunday. Hour is local time (0-23).
+Save it permanently by including it in `--calibrate`:
 
 ```bash
-python ccburn_web.py --session-limit 50000000 --weekly-limit 400000000
-# or
-export CCBURN_SESSION_LIMIT=50000000
-export CCBURN_WEEKLY_LIMIT=400000000
+python ccburn.py --calibrate-session 16 --calibrate-weekly 38 \
+                 --week-reset-day 0 --week-reset-hour 11
+```
+
+## Plan presets (rough defaults if you skip calibration)
+
+| Plan    | Session (weighted) | Weekly        |
+|---------|--------------------|---------------|
+| `pro`   |  1,000,000         |  10,000,000   |
+| `max5`  |  4,500,000 (default) |  48,000,000 |
+| `max20` | 18,000,000         | 192,000,000   |
+
+```bash
+python ccburn_web.py --plan pro
+```
+
+## All options
+
+```
+--claude-dir PATH       where ~/.claude lives (default: home)
+--plan {pro,max5,max20} preset budgets
+--session-limit N       override session weighted-token cap
+--weekly-limit N        override weekly weighted-token cap
+--week-reset-day 0-6    weekly reset weekday in local time (Mon=0)
+--week-reset-hour 0-23  weekly reset hour in local time
+--calibrate-session PCT current session % from claude.ai → save inferred cap
+--calibrate-weekly PCT  current weekly  % from claude.ai → save inferred cap
+--watch N               (terminal) refresh every N seconds
+--port N                (web) HTTP port (default 8765)
+--no-open               (web) don't auto-open browser
 ```
 
 ## How it works
 
-Each assistant turn in your local transcripts has a `message.usage` block.
-ccburn applies Anthropic's pricing-equivalent weighting:
+Each assistant turn has a `message.usage` block. ccburn weights tokens by
+Anthropic's pricing ratios so the totals roughly track real cost:
 
 ```
 weighted = input + output × 5 + cache_creation × 1.25 + cache_read × 0.1
 ```
 
-Cache reads dominate raw counts but only cost ~10% of an input token, so
-weighting them avoids massive over-counting. The session window anchors on
-the first record in the last 5 hours; weekly anchors on the first record
-in the last 7 days.
+- **Session window:** anchored on the first message after the previous 5-hour
+  window expired (matches Anthropic's behaviour, not a rolling 5h).
+- **Weekly window:** fixed weekly schedule based on `--week-reset-day`/`-hour`.
 
-Numbers won't perfectly match claude.ai's official dashboard (their formula
-isn't public), but trends should track. Tune `--session-limit` /
-`--weekly-limit` until the percentages match your real ones.
+Numbers are estimates, not 1:1 with Anthropic's official dashboard. Calibrate
+(above) and they'll match closely.

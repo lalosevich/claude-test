@@ -1,87 +1,25 @@
 #!/usr/bin/env python3
-"""ccburn_web - browser-based usage dashboard for Claude Code.
-
-Reads ~/.claude/projects/**/*.jsonl, sums cost-weighted tokens, and serves a
-self-contained dashboard at http://127.0.0.1:8765 (auto-opens in your browser).
-"""
+"""ccburn_web - browser dashboard for Claude Code usage."""
 
 import argparse
-import glob
-import json
+import logging
 import os
 import sys
 import threading
-import time
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
-    from flask import Flask, jsonify, Response
+    from flask import Flask, Response, jsonify
 except ImportError:
     sys.stderr.write("Missing dependency: pip install flask\n")
     sys.exit(1)
 
-
-PLAN_LIMITS = {
-    "pro":   (  5_000_000,  40_000_000),
-    "max5":  ( 30_000_000, 250_000_000),
-    "max20": (120_000_000, 1_000_000_000),
-}
-
-
-def find_jsonl(claude_dir: Path):
-    return glob.glob(str(claude_dir / "projects" / "**" / "*.jsonl"), recursive=True)
-
-
-def weighted_tokens(usage: dict) -> float:
-    return (
-        usage.get("input_tokens", 0)
-        + usage.get("output_tokens", 0) * 5.0
-        + usage.get("cache_creation_input_tokens", 0) * 1.25
-        + usage.get("cache_read_input_tokens", 0) * 0.1
-    )
-
-
-def parse_records(paths):
-    seen = set()
-    for p in paths:
-        try:
-            f = open(p, "r", encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        with f:
-            for line in f:
-                try:
-                    d = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                msg = d.get("message")
-                ts = d.get("timestamp")
-                if not isinstance(msg, dict) or not ts:
-                    continue
-                usage = msg.get("usage")
-                if not isinstance(usage, dict):
-                    continue
-                mid = msg.get("id")
-                if mid:
-                    if mid in seen:
-                        continue
-                    seen.add(mid)
-                try:
-                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                yield dt, weighted_tokens(usage)
-
-
-def build_window(records, now, duration):
-    cutoff = now - duration
-    in_window = sorted((t, n) for t, n in records if cutoff <= t <= now)
-    if not in_window:
-        return now, now + duration, []
-    start = in_window[0][0]
-    return start, start + duration, in_window
+from ccburn_lib import (
+    PLAN_LIMITS, calibrate, find_jsonl, load_config, parse_records,
+    session_window, weekly_window,
+)
 
 
 def serialize_window(start, end, recs, budget, now):
@@ -127,8 +65,9 @@ def make_app(args):
             return jsonify({"error": f"No Claude data directory at {claude_dir}"}), 404
         records = list(parse_records(find_jsonl(claude_dir)))
         now = datetime.now(timezone.utc)
-        s_start, s_end, s_rec = build_window(records, now, timedelta(hours=5))
-        w_start, w_end, w_rec = build_window(records, now, timedelta(days=7))
+        s_start, s_end, s_rec = session_window(records, now, hours=5)
+        w_start, w_end, w_rec = weekly_window(
+            records, now, args.week_reset_day, args.week_reset_hour)
         return jsonify({
             "plan": args.plan,
             "generated_at": now.isoformat(),
@@ -149,18 +88,10 @@ INDEX_HTML = r"""<!doctype html>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
-    --bg: #0b0b10;
-    --panel: #15151d;
-    --panel-2: #1c1c26;
-    --border: #2a2a38;
-    --text: #e8e8f0;
-    --dim: #8a8a9a;
-    --accent: #ff7849;
-    --green: #4ade80;
-    --yellow: #fbbf24;
-    --red: #ef4444;
-    --blue: #60a5fa;
-    --purple: #a78bfa;
+    --bg: #0b0b10; --panel: #15151d; --panel-2: #1c1c26;
+    --border: #2a2a38; --text: #e8e8f0; --dim: #8a8a9a;
+    --accent: #ff7849; --green: #4ade80; --yellow: #fbbf24;
+    --red: #ef4444; --blue: #60a5fa; --purple: #a78bfa;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -172,8 +103,7 @@ INDEX_HTML = r"""<!doctype html>
   }
   header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 24px 32px 8px 32px;
-    max-width: 1280px; margin: 0 auto;
+    padding: 24px 32px 8px; max-width: 1280px; margin: 0 auto;
   }
   header .brand { display: flex; align-items: baseline; gap: 12px; }
   header h1 { font-size: 28px; margin: 0; font-weight: 700; letter-spacing: -0.02em; }
@@ -186,15 +116,13 @@ INDEX_HTML = r"""<!doctype html>
   header .plan b { color: var(--accent); font-weight: 600; }
   main {
     display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
-    padding: 16px 32px 32px 32px; max-width: 1280px; margin: 0 auto;
+    padding: 16px 32px 32px; max-width: 1280px; margin: 0 auto;
   }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
   .panel {
     background: linear-gradient(180deg, var(--panel-2), var(--panel));
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 20px 22px;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    border: 1px solid var(--border); border-radius: 16px;
+    padding: 20px 22px; box-shadow: 0 10px 30px rgba(0,0,0,0.35);
   }
   .panel-head {
     display: flex; justify-content: space-between; align-items: center;
@@ -209,11 +137,8 @@ INDEX_HTML = r"""<!doctype html>
     gap: 12px; margin-bottom: 10px;
   }
   .bar-row .label { color: var(--dim); font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; }
-  .bar {
-    position: relative;
-    height: 10px; background: rgba(255,255,255,0.06);
-    border-radius: 999px; overflow: hidden;
-  }
+  .bar { position: relative; height: 10px; background: rgba(255,255,255,0.06);
+    border-radius: 999px; overflow: hidden; }
   .bar-fill {
     height: 100%; border-radius: 999px;
     transition: width 0.6s cubic-bezier(.2,.7,.2,1), background 0.3s;
@@ -224,18 +149,13 @@ INDEX_HTML = r"""<!doctype html>
     background: linear-gradient(90deg, var(--blue), var(--purple));
     box-shadow: 0 0 12px rgba(96,165,250,0.3);
   }
-  .pct { text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; color: var(--text); }
+  .pct { text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; }
   .chart-wrap { position: relative; height: 220px; margin-top: 18px; }
-  .totals {
-    display: flex; justify-content: space-between; align-items: center;
-    margin-top: 14px; color: var(--dim); font-size: 12px;
-  }
+  .totals { display: flex; justify-content: space-between; align-items: center;
+    margin-top: 14px; color: var(--dim); font-size: 12px; }
   .totals b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
-  footer {
-    max-width: 1280px; margin: 0 auto;
-    padding: 8px 32px 24px 32px;
-    color: var(--dim); font-size: 12px; text-align: center;
-  }
+  footer { max-width: 1280px; margin: 0 auto;
+    padding: 8px 32px 24px; color: var(--dim); font-size: 12px; text-align: center; }
   .pulse { animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
   .err {
@@ -256,7 +176,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="err"></div>
 
 <main>
-  <section class="panel" id="session-panel">
+  <section class="panel">
     <div class="panel-head">
       <h2>Session<span class="duration">5 hours</span></h2>
       <div class="reset">resets in <b id="session-reset" class="pulse">—</b></div>
@@ -278,7 +198,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
 
-  <section class="panel" id="weekly-panel">
+  <section class="panel">
     <div class="panel-head">
       <h2>Weekly<span class="duration">7 days</span></h2>
       <div class="reset">resets in <b id="weekly-reset" class="pulse">—</b></div>
@@ -315,32 +235,21 @@ const C = {
   purple: CSS.getPropertyValue('--purple').trim(),
   dim:    CSS.getPropertyValue('--dim').trim(),
 };
-
-function pickColor(pct) {
-  if (pct < 70) return C.green;
-  if (pct < 90) return C.yellow;
-  return C.red;
+function pickColor(p) { return p < 70 ? C.green : p < 90 ? C.yellow : C.red; }
+function pickGlow(p) {
+  return p < 70 ? 'rgba(74,222,128,0.45)' :
+         p < 90 ? 'rgba(251,191,36,0.45)' : 'rgba(239,68,68,0.5)';
 }
-function pickGlow(pct) {
-  if (pct < 70) return 'rgba(74,222,128,0.45)';
-  if (pct < 90) return 'rgba(251,191,36,0.45)';
-  return 'rgba(239,68,68,0.5)';
-}
-
 function fmtTokens(n) {
   if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
   if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
   return Math.round(n).toLocaleString();
 }
-function fmtDuration(secs) {
-  secs = Math.max(0, Math.round(secs));
-  const h = Math.floor(secs / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  if (h >= 24) {
-    const d = Math.floor(h / 24);
-    return `${d}d ${h % 24}h`;
-  }
+function fmtDuration(s) {
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  if (h >= 24) { const d = Math.floor(h / 24); return `${d}d ${h % 24}h`; }
   if (h) return `${h}h ${String(m).padStart(2,'0')}m`;
   return `${m}m`;
 }
@@ -349,8 +258,9 @@ function makeChart(ctx, totalMin) {
   return new Chart(ctx, {
     type: 'line',
     data: { datasets: [
-      { label: 'Usage', data: [], borderColor: C.green, backgroundColor: 'rgba(74,222,128,0.18)',
-        fill: 'origin', tension: 0.25, borderWidth: 2, pointRadius: 0 },
+      { label: 'Usage', data: [], borderColor: C.green,
+        backgroundColor: 'rgba(74,222,128,0.18)', fill: 'origin',
+        tension: 0.25, borderWidth: 2, pointRadius: 0 },
       { label: 'Pace', data: [{x:0,y:0},{x:totalMin,y:100}],
         borderColor: C.dim, borderDash: [4,4], borderWidth: 1, pointRadius: 0, fill: false },
       { label: 'Projection', data: [], borderColor: C.purple, borderDash: [6,3],
@@ -364,7 +274,7 @@ function makeChart(ctx, totalMin) {
       plugins: {
         legend: { display: true, position: 'top', align: 'end',
           labels: { color: C.dim, boxWidth: 10, boxHeight: 2, font: { size: 11 } } },
-        tooltip: { enabled: true, mode: 'index', intersect: false,
+        tooltip: { mode: 'index', intersect: false,
           backgroundColor: 'rgba(20,20,28,0.95)', borderColor: '#2a2a38', borderWidth: 1,
           callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}%` } },
       },
@@ -372,51 +282,38 @@ function makeChart(ctx, totalMin) {
         x: { type: 'linear', min: 0, max: totalMin,
              grid: { color: 'rgba(255,255,255,0.04)' },
              ticks: { color: C.dim, font: { size: 10 },
-                      callback: (v) => totalMin > 600 ? `${Math.round(v/60/24)}d` : `${Math.round(v/60)}h` } },
-        y: { min: 0, max: 110,
-             grid: { color: 'rgba(255,255,255,0.04)' },
-             ticks: { color: C.dim, font: { size: 10 },
-                      callback: (v) => v + '%' } },
+                      callback: v => totalMin > 600 ? `${Math.round(v/60/24)}d` : `${Math.round(v/60)}h` } },
+        y: { min: 0, max: 110, grid: { color: 'rgba(255,255,255,0.04)' },
+             ticks: { color: C.dim, font: { size: 10 }, callback: v => v + '%' } },
       },
     },
   });
 }
 
 let sChart, wChart;
-
-function updatePanel(prefix, data, chart) {
-  const pct = data.pct;
-  const elapsedPct = data.elapsed_pct;
-  const usageEl = document.getElementById(prefix + '-usage');
-  usageEl.style.width = Math.min(100, pct) + '%';
-  usageEl.style.background = `linear-gradient(90deg, ${pickColor(pct)}, ${pickColor(pct)})`;
-  usageEl.style.boxShadow = `0 0 12px ${pickGlow(pct)}`;
+function updatePanel(prefix, d, chart) {
+  const pct = d.pct, ep = d.elapsed_pct;
+  const u = document.getElementById(prefix + '-usage');
+  u.style.width = Math.min(100, pct) + '%';
+  u.style.background = `linear-gradient(90deg, ${pickColor(pct)}, ${pickColor(pct)})`;
+  u.style.boxShadow = `0 0 12px ${pickGlow(pct)}`;
   document.getElementById(prefix + '-usage-pct').textContent = pct.toFixed(1) + '%';
+  document.getElementById(prefix + '-elapsed').style.width = Math.min(100, ep) + '%';
+  document.getElementById(prefix + '-elapsed-pct').textContent = ep.toFixed(1) + '%';
+  document.getElementById(prefix + '-reset').textContent = fmtDuration(d.reset_seconds);
+  document.getElementById(prefix + '-tokens').textContent = fmtTokens(d.total_tokens);
+  document.getElementById(prefix + '-budget').textContent = fmtTokens(d.budget);
+  document.getElementById(prefix + '-proj').textContent = d.projection_pct.toFixed(1) + '%';
 
-  document.getElementById(prefix + '-elapsed').style.width = Math.min(100, elapsedPct) + '%';
-  document.getElementById(prefix + '-elapsed-pct').textContent = elapsedPct.toFixed(1) + '%';
-
-  document.getElementById(prefix + '-reset').textContent = fmtDuration(data.reset_seconds);
-  document.getElementById(prefix + '-tokens').textContent = fmtTokens(data.total_tokens);
-  document.getElementById(prefix + '-budget').textContent = fmtTokens(data.budget);
-  document.getElementById(prefix + '-proj').textContent = data.projection_pct.toFixed(1) + '%';
-
-  const usagePoints = data.series.map(p => ({ x: p.minute, y: Math.min(120, p.pct) }));
-  const last = usagePoints.length ? usagePoints[usagePoints.length - 1] : null;
-  chart.data.datasets[0].data = usagePoints;
+  const pts = d.series.map(p => ({ x: p.minute, y: Math.min(120, p.pct) }));
+  chart.data.datasets[0].data = pts;
   chart.data.datasets[0].borderColor = pickColor(pct);
   chart.data.datasets[0].backgroundColor = pickGlow(pct).replace('0.45', '0.18').replace('0.5','0.2');
-
-  chart.data.datasets[2].data = last
-    ? [{ x: 0, y: 0 }, { x: data.total_minutes, y: Math.min(120, data.projection_pct) }]
-    : [];
-
+  chart.data.datasets[2].data = pts.length
+    ? [{x:0,y:0},{x:d.total_minutes, y: Math.min(120, d.projection_pct)}] : [];
   chart.data.datasets[3].data = [
-    { x: data.elapsed_minutes, y: 0 },
-    { x: data.elapsed_minutes, y: 110 },
-  ];
-
-  chart.options.scales.x.max = data.total_minutes;
+    {x: d.elapsed_minutes, y: 0}, {x: d.elapsed_minutes, y: 110}];
+  chart.options.scales.x.max = d.total_minutes;
   chart.update();
 }
 
@@ -424,21 +321,17 @@ async function refresh() {
   try {
     const r = await fetch('/api/usage');
     const d = await r.json();
-    if (d.error) {
-      document.getElementById('err').innerHTML = `<div class="err">${d.error}</div>`;
-      return;
-    }
+    if (d.error) { document.getElementById('err').innerHTML = `<div class="err">${d.error}</div>`; return; }
     document.getElementById('err').innerHTML = '';
     document.getElementById('plan').textContent = d.plan;
     if (!sChart) sChart = makeChart(document.getElementById('session-chart'), d.session.total_minutes);
     if (!wChart) wChart = makeChart(document.getElementById('weekly-chart'), d.weekly.total_minutes);
     updatePanel('session', d.session, sChart);
-    updatePanel('weekly',  d.weekly,  wChart);
+    updatePanel('weekly', d.weekly, wChart);
   } catch (e) {
     document.getElementById('err').innerHTML = `<div class="err">Failed to load: ${e}</div>`;
   }
 }
-
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -448,33 +341,52 @@ setInterval(refresh, 5000);
 
 
 def main():
+    cfg = load_config()
     ap = argparse.ArgumentParser(description="Browser-based usage dashboard for Claude Code")
-    ap.add_argument("--claude-dir", default=os.environ.get("CLAUDE_DIR", str(Path.home() / ".claude")))
+    ap.add_argument("--claude-dir", default=os.environ.get(
+        "CLAUDE_DIR", str(Path.home() / ".claude")))
     ap.add_argument("--plan", choices=PLAN_LIMITS.keys(),
-                    default=os.environ.get("CCBURN_PLAN", "max5"))
+                    default=os.environ.get("CCBURN_PLAN", cfg.get("plan", "max5")))
     ap.add_argument("--session-limit", type=int, default=None)
     ap.add_argument("--weekly-limit", type=int, default=None)
+    ap.add_argument("--week-reset-day", type=int,
+                    default=cfg.get("week_reset_day", 0),
+                    help="0=Mon … 6=Sun (default 0)")
+    ap.add_argument("--week-reset-hour", type=int,
+                    default=cfg.get("week_reset_hour", 0),
+                    help="0-23, local time (default 0)")
+    ap.add_argument("--calibrate-session", type=float, metavar="PCT")
+    ap.add_argument("--calibrate-weekly", type=float, metavar="PCT")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--no-open", action="store_true", help="Don't open the browser automatically")
+    ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
+
+    if args.calibrate_session is not None or args.calibrate_weekly is not None:
+        new_cfg = calibrate(
+            Path(args.claude_dir).expanduser(), args.plan,
+            args.calibrate_session, args.calibrate_weekly,
+            args.week_reset_day, args.week_reset_hour,
+        )
+        print("Calibrated and saved to ~/.ccburn.json:")
+        for k, v in new_cfg.items():
+            print(f"  {k}: {v}")
+        return
 
     default_s, default_w = PLAN_LIMITS[args.plan]
     if args.session_limit is None:
-        args.session_limit = int(os.environ.get("CCBURN_SESSION_LIMIT", default_s))
+        args.session_limit = int(os.environ.get("CCBURN_SESSION_LIMIT",
+                                                cfg.get("session_limit", default_s)))
     if args.weekly_limit is None:
-        args.weekly_limit = int(os.environ.get("CCBURN_WEEKLY_LIMIT", default_w))
+        args.weekly_limit = int(os.environ.get("CCBURN_WEEKLY_LIMIT",
+                                               cfg.get("weekly_limit", default_w)))
 
     app = make_app(args)
     url = f"http://{args.host}:{args.port}"
     print(f"\n  🔥 ccburn web dashboard at {url}")
     print(f"     Plan: {args.plan}   Press Ctrl+C to stop.\n")
-
     if not args.no_open:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-
-    # silence Flask's default request log noise
-    import logging
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
 
