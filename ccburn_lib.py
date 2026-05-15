@@ -70,26 +70,18 @@ def parse_records(paths):
 
 
 def session_window(records, now, hours=5):
-    """Anthropic-style anchored session.
+    """Anthropic-style rolling 5h session.
 
-    Walk forward through messages: a new session starts whenever the next
-    message arrives at-or-after `previous_session_start + hours`. The active
-    session is the latest one whose [start, start+hours) contains `now`.
+    The session resets 5h after the oldest message in the rolling 5h window,
+    so session_end = oldest_message_in_last_5h + 5h.
     """
     duration = timedelta(hours=hours)
-    sorted_recs = sorted((t, n) for t, n in records if t <= now)
-
-    session_start = None
-    session_recs: list = []
-    for t, n in sorted_recs:
-        if session_start is None or t >= session_start + duration:
-            session_start = t
-            session_recs = []
-        session_recs.append((t, n))
-
-    if session_start is None or now >= session_start + duration:
+    cutoff = now - duration
+    in_window = sorted((t, n) for t, n in records if cutoff <= t <= now)
+    if not in_window:
         return now, now + duration, []
-    return session_start, session_start + duration, session_recs
+    start = in_window[0][0]
+    return start, start + duration, in_window
 
 
 def weekly_window(records, now, reset_weekday=0, reset_hour=11, tz=None):
