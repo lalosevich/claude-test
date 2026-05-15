@@ -185,3 +185,29 @@ def calibrate(claude_dir: Path, plan: str, session_pct: float = None,
 
     save_config(cfg)
     return cfg
+
+
+def save_snapshot(session_pct=None, weekly_pct=None,
+                  session_reset_seconds=None, weekly_reset_seconds=None,
+                  sonnet_pct=None) -> dict:
+    """Persist a manual Anthropic dashboard reading to ~/.ccburn.json."""
+    cfg = load_config()
+    snap = cfg.get("snapshot", {})
+    snap["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if session_pct is not None:
+        snap["session_pct"] = float(session_pct)
+    if weekly_pct is not None:
+        snap["weekly_pct"] = float(weekly_pct)
+    if session_reset_seconds is not None:
+        snap["session_reset_seconds"] = float(session_reset_seconds)
+    if weekly_reset_seconds is not None:
+        snap["weekly_reset_seconds"] = float(weekly_reset_seconds)
+    if sonnet_pct is not None:
+        snap["sonnet_pct"] = float(sonnet_pct)
+    cfg["snapshot"] = snap
+    save_config(cfg)
+    return snap
+
+
+def get_snapshot() -> dict:
+    return load_config().get("snapshot", {})

@@ -11,14 +11,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
-    from flask import Flask, Response, jsonify
+    from flask import Flask, Response, jsonify, request
 except ImportError:
     sys.stderr.write("Missing dependency: pip install flask\n")
     sys.exit(1)
 
 from ccburn_lib import (
-    PLAN_LIMITS, calibrate, find_jsonl, load_config, parse_records,
-    session_window, weekly_window,
+    PLAN_LIMITS, calibrate, find_jsonl, get_snapshot, load_config,
+    parse_records, save_snapshot, session_window, weekly_window,
 )
 
 
@@ -51,8 +51,21 @@ def serialize_window(start, end, recs, budget, now):
     }
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
 def make_app(args):
     app = Flask(__name__)
+
+    @app.after_request
+    def add_cors(resp):
+        for k, v in CORS_HEADERS.items():
+            resp.headers.setdefault(k, v)
+        return resp
 
     @app.route("/")
     def index():
@@ -73,7 +86,26 @@ def make_app(args):
             "generated_at": now.isoformat(),
             "session": serialize_window(s_start, s_end, s_rec, args.session_limit, now),
             "weekly":  serialize_window(w_start, w_end, w_rec, args.weekly_limit, now),
+            "snapshot": get_snapshot(),
+            "latest_record": (max((t for t, _ in records), default=None)
+                              .isoformat() if records else None),
         })
+
+    @app.route("/api/snapshot", methods=["GET", "POST", "OPTIONS"])
+    def api_snapshot():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        if request.method == "GET":
+            return jsonify(get_snapshot())
+        data = request.get_json(silent=True) or {}
+        snap = save_snapshot(
+            session_pct=data.get("session_pct"),
+            weekly_pct=data.get("weekly_pct"),
+            session_reset_seconds=data.get("session_reset_seconds"),
+            weekly_reset_seconds=data.get("weekly_reset_seconds"),
+            sonnet_pct=data.get("sonnet_pct"),
+        )
+        return jsonify(snap)
 
     return app
 
@@ -162,6 +194,62 @@ INDEX_HTML = r"""<!doctype html>
     background: rgba(239,68,68,0.1); border: 1px solid var(--red); color: var(--red);
     padding: 16px; border-radius: 12px; margin: 16px 32px; max-width: 1280px;
   }
+  .snapshot {
+    max-width: 1280px; margin: 0 auto;
+    padding: 0 32px;
+  }
+  .snapshot-card {
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--border); border-radius: 16px;
+    padding: 18px 22px; box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+  .snapshot-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 14px;
+  }
+  .snapshot-head h2 { font-size: 16px; margin: 0; font-weight: 600; }
+  .snapshot-head .sub { color: var(--dim); font-size: 12px; margin-left: 8px; }
+  .snapshot-head .updated { color: var(--dim); font-size: 12px; margin-right: 10px; }
+  .btn {
+    background: var(--accent); color: #1a0a00; border: none;
+    padding: 6px 14px; border-radius: 8px; font-weight: 600; font-size: 12px;
+    cursor: pointer; transition: filter 0.15s;
+  }
+  .btn:hover { filter: brightness(1.1); }
+  .btn-ghost {
+    background: transparent; color: var(--text); border: 1px solid var(--border);
+  }
+  .snap-row {
+    display: grid; grid-template-columns: 90px 1fr 70px 90px; align-items: center;
+    gap: 12px; margin-bottom: 8px;
+  }
+  .snap-row .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .snap-row .reset { text-align: right; color: var(--dim); font-size: 12px; }
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none;
+    align-items: center; justify-content: center; z-index: 10;
+  }
+  .modal-bg.show { display: flex; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 24px; min-width: 360px; max-width: 480px;
+  }
+  .modal h3 { margin: 0 0 6px 0; font-size: 18px; }
+  .modal p { color: var(--dim); font-size: 13px; margin: 0 0 16px 0; }
+  .field { display: grid; grid-template-columns: 130px 1fr; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .field label { color: var(--dim); font-size: 13px; }
+  .field input {
+    background: #0b0b10; border: 1px solid var(--border); color: var(--text);
+    padding: 8px 10px; border-radius: 8px; font-size: 14px; outline: none;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  .stale { color: var(--yellow); }
+  details.help {
+    margin-top: 10px; color: var(--dim); font-size: 12px;
+  }
+  details.help summary { cursor: pointer; }
+  details.help code { background: #0b0b10; padding: 2px 6px; border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -175,10 +263,70 @@ INDEX_HTML = r"""<!doctype html>
 
 <div id="err"></div>
 
+<div class="snapshot">
+  <div class="snapshot-card">
+    <div class="snapshot-head">
+      <div>
+        <h2 style="display:inline">Anthropic (claude.ai)</h2>
+        <span class="sub">manual snapshot — your real account-wide usage</span>
+      </div>
+      <div>
+        <span class="updated" id="snap-updated">no snapshot yet</span>
+        <button class="btn" onclick="openSnapModal()">Update</button>
+      </div>
+    </div>
+    <div class="snap-row">
+      <span class="label">Session</span>
+      <div class="bar"><div class="bar-fill" id="snap-session-fill"></div></div>
+      <span class="pct" id="snap-session-pct">—</span>
+      <span class="reset" id="snap-session-reset">—</span>
+    </div>
+    <div class="snap-row">
+      <span class="label">Weekly</span>
+      <div class="bar"><div class="bar-fill" id="snap-weekly-fill"></div></div>
+      <span class="pct" id="snap-weekly-pct">—</span>
+      <span class="reset" id="snap-weekly-reset">—</span>
+    </div>
+    <details class="help">
+      <summary>One-click update from claude.ai (bookmarklet)</summary>
+      <p>Drag this link to your bookmarks bar, then click it while on
+        <code>claude.ai/settings/usage</code> — it scrapes the %s and pushes them here.</p>
+      <p><a id="bookmarklet" href="#">ccburn snapshot</a></p>
+    </details>
+  </div>
+</div>
+
+<div class="modal-bg" id="snap-modal">
+  <div class="modal">
+    <h3>Update Anthropic snapshot</h3>
+    <p>Copy your current numbers from <a href="https://claude.ai/settings/usage" target="_blank" style="color:var(--accent)">claude.ai/settings/usage</a>.</p>
+    <div class="field">
+      <label for="in-session-pct">Session %</label>
+      <input id="in-session-pct" type="number" min="0" max="100" step="0.1" placeholder="39">
+    </div>
+    <div class="field">
+      <label for="in-session-reset">Resets in (e.g. 1h 13m)</label>
+      <input id="in-session-reset" type="text" placeholder="1h 13m">
+    </div>
+    <div class="field">
+      <label for="in-weekly-pct">Weekly %</label>
+      <input id="in-weekly-pct" type="number" min="0" max="100" step="0.1" placeholder="46">
+    </div>
+    <div class="field">
+      <label for="in-weekly-reset">Resets in (e.g. 2d 14h)</label>
+      <input id="in-weekly-reset" type="text" placeholder="2d 14h">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeSnapModal()">Cancel</button>
+      <button class="btn" onclick="saveSnap()">Save</button>
+    </div>
+  </div>
+</div>
+
 <main>
   <section class="panel">
     <div class="panel-head">
-      <h2>Session<span class="duration">5 hours</span></h2>
+      <h2>CLI Session<span class="duration">5h · Claude Code only</span></h2>
       <div class="reset">resets in <b id="session-reset" class="pulse">—</b></div>
     </div>
     <div class="bar-row">
@@ -200,7 +348,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <section class="panel">
     <div class="panel-head">
-      <h2>Weekly<span class="duration">7 days</span></h2>
+      <h2>CLI Weekly<span class="duration">7d · Claude Code only</span></h2>
       <div class="reset">resets in <b id="weekly-reset" class="pulse">—</b></div>
     </div>
     <div class="bar-row">
@@ -222,7 +370,8 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 
 <footer>
-  Auto-refreshes every 5s · weighted tokens (cache reads count 0.1×) · estimates, not Anthropic's official numbers
+  Top panel: manual snapshots of Anthropic's account-wide numbers (covers web + CLI + desktop).<br>
+  Lower panels: tokens parsed from local Claude Code JSONLs only — won't reflect claude.ai or Desktop activity.
 </footer>
 
 <script>
@@ -334,6 +483,126 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 5000);
+
+// ------- Anthropic snapshot panel -------
+
+function parseDurationToSeconds(s) {
+  if (!s) return null;
+  s = String(s).trim().toLowerCase();
+  let total = 0; let matched = false;
+  const re = /(\d+)\s*(d|h|hr|hrs|m|min|mins)/g; let m;
+  while ((m = re.exec(s)) !== null) {
+    matched = true;
+    const n = parseInt(m[1]);
+    const u = m[2];
+    if (u === 'd') total += n * 86400;
+    else if (u.startsWith('h')) total += n * 3600;
+    else if (u.startsWith('m')) total += n * 60;
+  }
+  if (!matched) {
+    const n = parseFloat(s);
+    if (!isNaN(n)) total = n * 60; // bare number = minutes
+  }
+  return total || null;
+}
+
+function renderSnap(snap) {
+  if (!snap || !snap.updated_at) {
+    document.getElementById('snap-updated').textContent = 'no snapshot yet';
+    return;
+  }
+  const ageSec = (Date.now() - new Date(snap.updated_at).getTime()) / 1000;
+  const ageStr = ageSec < 60 ? 'just now'
+               : ageSec < 3600 ? `${Math.round(ageSec/60)}m ago`
+               : `${Math.round(ageSec/3600)}h ago`;
+  const u = document.getElementById('snap-updated');
+  u.textContent = 'updated ' + ageStr;
+  u.className = 'updated' + (ageSec > 1800 ? ' stale' : '');
+
+  if (snap.session_pct != null) {
+    const p = snap.session_pct;
+    const f = document.getElementById('snap-session-fill');
+    f.style.width = Math.min(100, p) + '%';
+    f.style.background = `linear-gradient(90deg, ${pickColor(p)}, ${pickColor(p)})`;
+    f.style.boxShadow = `0 0 12px ${pickGlow(p)}`;
+    document.getElementById('snap-session-pct').textContent = p.toFixed(1) + '%';
+  }
+  if (snap.session_reset_seconds != null) {
+    const elapsed = (Date.now() - new Date(snap.updated_at).getTime()) / 1000;
+    document.getElementById('snap-session-reset').textContent =
+      'resets in ' + fmtDuration(snap.session_reset_seconds - elapsed);
+  }
+  if (snap.weekly_pct != null) {
+    const p = snap.weekly_pct;
+    const f = document.getElementById('snap-weekly-fill');
+    f.style.width = Math.min(100, p) + '%';
+    f.style.background = `linear-gradient(90deg, ${pickColor(p)}, ${pickColor(p)})`;
+    f.style.boxShadow = `0 0 12px ${pickGlow(p)}`;
+    document.getElementById('snap-weekly-pct').textContent = p.toFixed(1) + '%';
+  }
+  if (snap.weekly_reset_seconds != null) {
+    const elapsed = (Date.now() - new Date(snap.updated_at).getTime()) / 1000;
+    document.getElementById('snap-weekly-reset').textContent =
+      'resets in ' + fmtDuration(snap.weekly_reset_seconds - elapsed);
+  }
+}
+
+// Patch refresh() to also pull snapshot
+const _origRefresh = refresh;
+refresh = async function() {
+  await _origRefresh();
+  try {
+    const r = await fetch('/api/usage');
+    const d = await r.json();
+    if (d.snapshot) renderSnap(d.snapshot);
+  } catch (e) { /* ignore */ }
+};
+
+function openSnapModal() {
+  document.getElementById('snap-modal').classList.add('show');
+}
+function closeSnapModal() {
+  document.getElementById('snap-modal').classList.remove('show');
+}
+
+async function saveSnap() {
+  const payload = {
+    session_pct: parseFloat(document.getElementById('in-session-pct').value) || null,
+    weekly_pct: parseFloat(document.getElementById('in-weekly-pct').value) || null,
+    session_reset_seconds: parseDurationToSeconds(document.getElementById('in-session-reset').value),
+    weekly_reset_seconds: parseDurationToSeconds(document.getElementById('in-weekly-reset').value),
+  };
+  try {
+    const r = await fetch('/api/snapshot', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const snap = await r.json();
+    renderSnap(snap);
+    closeSnapModal();
+  } catch (e) {
+    alert('Save failed: ' + e);
+  }
+}
+
+// Generate bookmarklet that scrapes claude.ai and posts to this server
+(function() {
+  const origin = window.location.origin;
+  const code = "javascript:(function(){"
+    + "var t=document.body.innerText;"
+    + "var s=t.match(/Current session[\\s\\S]*?(\\d+)%/);"
+    + "var w=t.match(/All models[\\s\\S]*?(\\d+)%/);"
+    + "var sr=t.match(/Current session[\\s\\S]*?Resets in\\s*(?:(\\d+)\\s*hr)?\\s*(?:(\\d+)\\s*min)?/);"
+    + "if(!s||!w){alert('ccburn: usage values not found on this page');return}"
+    + "var body={session_pct:+s[1],weekly_pct:+w[1]};"
+    + "if(sr){body.session_reset_seconds=(+sr[1]||0)*3600+(+sr[2]||0)*60;}"
+    + "fetch('" + origin + "/api/snapshot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),mode:'cors'})"
+    + ".then(r=>alert(r.ok?'ccburn updated: S '+s[1]+'%  W '+w[1]+'%':'ccburn save failed ('+r.status+')'))"
+    + ".catch(e=>alert('ccburn unreachable. Is the dashboard running?'));"
+    + "})();";
+  document.getElementById('bookmarklet').setAttribute('href', code);
+})();
 </script>
 </body>
 </html>
