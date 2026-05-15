@@ -1,2 +1,3 @@
 plotext>=5.2.8
 flask>=3.0.0
+playwright>=1.40.0

@@ -661,6 +661,9 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-open", action="store_true")
+    ap.add_argument("--auto-scrape", action="store_true",
+                    help="Start ccburn_scrape.py in the background")
+    ap.add_argument("--scrape-interval", type=int, default=600)
     args = ap.parse_args()
 
     if args.calibrate_session is not None or args.calibrate_weekly is not None:
@@ -684,12 +687,30 @@ def main():
 
     app = make_app(args)
     url = f"http://{args.host}:{args.port}"
-    print(f"\n  🔥 ccburn web dashboard at {url}")
-    print(f"     Plan: {args.plan}   Press Ctrl+C to stop.\n")
+    print(f"\n  ccburn web dashboard at {url}")
+    print(f"  Plan: {args.plan}   Press Ctrl+C to stop.\n")
     if not args.no_open:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+
+    scrape_proc = None
+    if args.auto_scrape:
+        import subprocess
+        script = Path(__file__).with_name("ccburn_scrape.py")
+        try:
+            scrape_proc = subprocess.Popen(
+                [sys.executable, str(script), "--interval", str(args.scrape_interval)],
+                cwd=str(script.parent),
+            )
+            print(f"  Auto-scraper running (pid {scrape_proc.pid}, every {args.scrape_interval}s)\n")
+        except Exception as e:
+            print(f"  Auto-scraper failed to start: {e}\n", file=sys.stderr)
+
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
-    app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
+    try:
+        app.run(host=args.host, port=args.port, debug=False, use_reloader=False)
+    finally:
+        if scrape_proc and scrape_proc.poll() is None:
+            scrape_proc.terminate()
 
 
 if __name__ == "__main__":
