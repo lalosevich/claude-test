@@ -91,6 +91,14 @@ def make_app(args):
                               .isoformat() if records else None),
         })
 
+    @app.route("/ccburn.user.js")
+    def userscript():
+        try:
+            content = _userscript_path().read_text(encoding="utf-8")
+        except OSError:
+            return Response("// userscript file missing", mimetype="text/javascript", status=500)
+        return Response(content, mimetype="text/javascript")
+
     @app.route("/api/snapshot", methods=["GET", "POST", "OPTIONS"])
     def api_snapshot():
         if request.method == "OPTIONS":
@@ -116,6 +124,10 @@ def make_app(args):
         return jsonify(snap)
 
     return app
+
+
+def _userscript_path():
+    return Path(__file__).with_name("ccburn.user.js")
 
 
 SNAPSHOT_OK_HTML = """<!doctype html>
@@ -307,11 +319,14 @@ INDEX_HTML = r"""<!doctype html>
       <span class="pct" id="snap-weekly-pct">—</span>
       <span class="reset" id="snap-weekly-reset">—</span>
     </div>
-    <details class="help">
-      <summary>One-click update from claude.ai (bookmarklet)</summary>
-      <p>Drag this link to your bookmarks bar, then click it while on
-        <code>claude.ai/settings/usage</code> — it scrapes the %s and pushes them here.</p>
-      <p><a id="bookmarklet" href="#">ccburn snapshot</a></p>
+    <details class="help" open>
+      <summary>Set up automatic syncing (one-time, ~30 seconds)</summary>
+      <ol style="margin:8px 0 0 18px;padding:0">
+        <li>Install <a href="https://chrome.google.com/webstore/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo" target="_blank" style="color:var(--accent)">Tampermonkey</a> for Chrome (free, ~10s).</li>
+        <li>Click here: <a href="/ccburn.user.js" target="_blank" style="color:var(--accent);font-weight:600">install ccburn auto-sync</a> — Tampermonkey will pop up &rarr; click <b>Install</b>.</li>
+        <li>Keep any <code>claude.ai</code> tab open. The userscript fetches your usage page in a hidden iframe every 10 min and pushes the %s here. No clicks ever.</li>
+      </ol>
+      <p style="margin-top:10px">Prefer a manual one-click instead? Drag <a id="bookmarklet" href="#">ccburn snapshot</a> to your bookmarks bar, then click it while on <code>claude.ai/settings/usage</code>.</p>
     </details>
   </div>
 </div>
