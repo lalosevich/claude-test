@@ -96,6 +96,14 @@ def make_app(args):
         if request.method == "OPTIONS":
             return ("", 204)
         if request.method == "GET":
+            if request.args:
+                save_snapshot(
+                    session_pct=request.args.get("session_pct", type=float),
+                    weekly_pct=request.args.get("weekly_pct", type=float),
+                    session_reset_seconds=request.args.get("session_reset_seconds", type=float),
+                    weekly_reset_seconds=request.args.get("weekly_reset_seconds", type=float),
+                )
+                return Response(SNAPSHOT_OK_HTML, mimetype="text/html")
             return jsonify(get_snapshot())
         data = request.get_json(silent=True) or {}
         snap = save_snapshot(
@@ -108,6 +116,18 @@ def make_app(args):
         return jsonify(snap)
 
     return app
+
+
+SNAPSHOT_OK_HTML = """<!doctype html>
+<html><head><title>ccburn updated</title></head>
+<body style="background:#0b0b10;color:#e8e8f0;font-family:-apple-system,Segoe UI,sans-serif;
+             padding:80px 40px;text-align:center;margin:0">
+  <h1 style="font-size:24px">ccburn updated</h1>
+  <p style="color:#8a8a9a">Snapshot saved. This tab will close in a moment.</p>
+  <p><a style="color:#ff7849;text-decoration:none"
+        href="http://127.0.0.1:8765/">Open dashboard &rarr;</a></p>
+  <script>setTimeout(function(){try{window.close()}catch(e){}}, 1500);</script>
+</body></html>"""
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -586,22 +606,34 @@ async function saveSnap() {
   }
 }
 
-// Generate bookmarklet that scrapes claude.ai and posts to this server
+// Bookmarklet — scrapes claude.ai/settings/usage, opens a localhost URL
+// (window.open avoids CORS + mixed-content issues that block fetch).
 (function() {
   const origin = window.location.origin;
   const code = "javascript:(function(){"
-    + "var t=document.body.innerText;"
-    + "var s=t.match(/Current session[\\s\\S]*?(\\d+)%/);"
-    + "var w=t.match(/All models[\\s\\S]*?(\\d+)%/);"
-    + "var sr=t.match(/Current session[\\s\\S]*?Resets in\\s*(?:(\\d+)\\s*hr)?\\s*(?:(\\d+)\\s*min)?/);"
-    + "if(!s||!w){alert('ccburn: usage values not found on this page');return}"
-    + "var body={session_pct:+s[1],weekly_pct:+w[1]};"
-    + "if(sr){body.session_reset_seconds=(+sr[1]||0)*3600+(+sr[2]||0)*60;}"
-    + "fetch('" + origin + "/api/snapshot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),mode:'cors'})"
-    + ".then(r=>alert(r.ok?'ccburn updated: S '+s[1]+'%  W '+w[1]+'%':'ccburn save failed ('+r.status+')'))"
-    + ".catch(e=>alert('ccburn unreachable. Is the dashboard running?'));"
+    + "var t=(document.body.innerText||'').replace(/\\u00A0/g,' ');"
+    + "function pct(label){"
+    +   "var re=new RegExp(label+'[^]*?(\\\\d+(?:\\\\.\\\\d+)?)\\\\s*%','i');"
+    +   "var m=t.match(re); return m?parseFloat(m[1]):null;"
+    + "}"
+    + "function reset(label){"
+    +   "var re=new RegExp(label+'[^]*?Resets?\\\\s+in\\\\s*(?:(\\\\d+)\\\\s*hr)?\\\\s*(?:(\\\\d+)\\\\s*min)?','i');"
+    +   "var m=t.match(re); if(!m) return null;"
+    +   "return (parseInt(m[1]||0))*3600+(parseInt(m[2]||0))*60;"
+    + "}"
+    + "var sp=pct('Current session')||pct('Session');"
+    + "var wp=pct('All models')||pct('Weekly');"
+    + "var sr=reset('Current session')||reset('Session');"
+    + "if(sp==null||wp==null){"
+    +   "var snip=t.substring(0,600).replace(/\\s+/g,' ');"
+    +   "alert('ccburn: cant find Session/Weekly %.\\n\\nURL: '+location.href+'\\n\\nIf youre not on https://claude.ai/settings/usage, go there first.\\n\\nPage text starts: '+snip);"
+    +   "return;"
+    + "}"
+    + "var qs='session_pct='+sp+'&weekly_pct='+wp+(sr?'&session_reset_seconds='+sr:'');"
+    + "window.open('" + origin + "/api/snapshot?'+qs,'ccburn');"
     + "})();";
   document.getElementById('bookmarklet').setAttribute('href', code);
+  document.getElementById('bookmarklet').textContent = 'ccburn snapshot';
 })();
 </script>
 </body>
